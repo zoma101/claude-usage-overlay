@@ -24,11 +24,14 @@ __version__ = "1.0.0"
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CONFIG = Path(__file__).with_name("overlay_config.json")
+CACHE = Path(__file__).with_name("overlay_cache.json")  # last known usage, shown on startup
 IS_WINDOWS = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 
-POLL_SECONDS = 60
-BACKOFF_SECONDS = 300  # after a 429
+POLL_SECONDS = 120
+BACKOFF_SECONDS = 300       # first wait after a 429 (doubles on each repeat)
+MAX_BACKOFF_SECONDS = 1800
+MIN_MANUAL_REFRESH = 15     # double-click can't hammer the endpoint
 MARGIN = 12
 MONO = "Consolas" if IS_WINDOWS else "Menlo" if IS_MAC else "DejaVu Sans Mono"
 
@@ -96,6 +99,24 @@ def load_config():
 def save_config(cfg):
     try:
         CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_cache():
+    try:
+        rows = json.loads(CACHE.read_text(encoding="utf-8"))
+        for row in rows:
+            row["resets_at"] = parse_time(row.get("resets_at"))
+        return rows
+    except Exception:
+        return None
+
+
+def save_cache(rows):
+    try:
+        data = [dict(r, resets_at=r["resets_at"].isoformat() if r["resets_at"] else None) for r in rows]
+        CACHE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -220,11 +241,15 @@ def set_autostart(enabled):
 class Overlay:
     def __init__(self):
         self.cfg = load_config()
-        self.rows = [dict(key="session", short="SES", name="Session", pct=None, resets_at=None),
-                     dict(key="week", short="WK", name="Week", pct=None, resets_at=None)]
+        # Start from the last known values (shown greyed out) until the first refresh.
+        self.rows = load_cache() or [
+            dict(key="session", short="SES", name="Session", pct=None, resets_at=None),
+            dict(key="week", short="WK", name="Week", pct=None, resets_at=None)]
         self.stale = True
         self.error = None
         self.next_poll = 0.0
+        self.last_poll = 0.0
+        self.backoff = 0
         self.fetching = False
         self.built_for = None
         self.updaters = []
@@ -443,7 +468,31 @@ class Overlay:
             y = top + MARGIN if "top" in corner else bottom - h - MARGIN
         else:
             x, y = self.cfg.get("x", 0), self.cfg.get("y", 0)
+            # Keep the whole overlay on screen when it grows (e.g. an error line appears).
+            w, h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
+            left, top, right, bottom = self.monitor_area(x, y)
+            x = max(left, min(x, right - w))
+            y = max(top, min(y, bottom - h))
         self.root.geometry(f"+{x}+{y}")
+
+    def monitor_area(self, x, y):
+        """Work area of the monitor containing (x, y), so it works on any screen."""
+        if IS_WINDOWS:
+            try:
+                class MONITORINFO(ctypes.Structure):
+                    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", ctypes.c_long * 4),
+                                ("rcWork", ctypes.c_long * 4), ("dwFlags", ctypes.c_ulong)]
+                user32 = ctypes.windll.user32
+                user32.MonitorFromPoint.restype = ctypes.c_void_p
+                user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                point = ctypes.c_longlong((y << 32) | (x & 0xFFFFFFFF))  # POINT passed by value
+                monitor = user32.MonitorFromPoint(point, 2)  # MONITOR_DEFAULTTONEAREST
+                info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+                if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                    return tuple(info.rcWork)
+            except Exception:
+                pass
+        return self.work_area()
 
     def snap(self, corner):
         self.cfg["corner"] = corner
@@ -473,7 +522,9 @@ class Overlay:
 
     # --- polling -------------------------------------------------------------
     def refresh_now(self):
-        self.next_poll = 0.0
+        # Manual refresh is ignored while rate limited, and throttled otherwise.
+        if not self.backoff:
+            self.next_poll = min(self.next_poll, self.last_poll + MIN_MANUAL_REFRESH)
 
     def poll(self):
         delay = POLL_SECONDS
@@ -482,10 +533,19 @@ class Overlay:
             rows = fetch_usage() or None
             if rows is None:
                 error = "no usage data"
+            self.backoff = 0
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
-                delay = BACKOFF_SECONDS
-            error = "token expired - open Claude Code" if exc.code == 401 else f"HTTP {exc.code}"
+                # Back off harder on every consecutive 429; honor Retry-After if given.
+                self.backoff = min(MAX_BACKOFF_SECONDS, max(BACKOFF_SECONDS, self.backoff * 2))
+                try:
+                    retry_after = int(exc.headers.get("Retry-After") or 0)
+                except ValueError:
+                    retry_after = 0
+                delay = max(self.backoff, retry_after)
+                error = "rate limited"
+            else:
+                error = "token expired - open Claude Code" if exc.code == 401 else f"HTTP {exc.code}"
         except (FileNotFoundError, subprocess.CalledProcessError, KeyError):
             error = "not logged in to Claude Code"
         except Exception:
@@ -497,6 +557,7 @@ class Overlay:
     def on_data(self, rows, error):
         if rows is not None:
             self.rows = rows
+            save_cache(rows)
         self.stale = rows is None
         self.error = error
         self.render()
@@ -513,16 +574,19 @@ class Overlay:
             shown = used if self.cfg["mode"] == "used" else max(0, 100 - used)
             color = t["dim"] if self.stale else t["high"] if used >= 80 else t["mid"] if used >= 50 else t["low"]
             update(f"{round(shown)}%", color, min(1, shown / 100), fmt_countdown(row["resets_at"]))
-        self.status.config(text=f"! {self.error}" if self.error else "")
+        error = self.error
+        if error == "rate limited":
+            wait = max(0, int(self.next_poll - time.monotonic()))
+            error = f"rate limited, retry {wait // 60}:{wait % 60:02d}"
+        self.status.config(text=f"! {error}" if error else "")
         if bool(self.error) != self.status_shown:
             self.status_shown = bool(self.error)
             if self.status_shown:
                 self.status.pack(fill="x")
             else:
                 self.status.pack_forget()
-            if self.cfg.get("corner"):
-                self.root.update_idletasks()
-                self.place()
+            self.root.update_idletasks()
+            self.place()
 
     def layout_signature(self):
         return tuple(r["key"] for r in self.rows), tuple(self.cfg[k] for k in VISUAL_KEYS)
@@ -530,6 +594,7 @@ class Overlay:
     def tick(self):
         if not self.fetching and time.monotonic() >= self.next_poll:
             self.fetching = True
+            self.last_poll = time.monotonic()
             threading.Thread(target=self.poll, daemon=True).start()
         self.render()
         self.root.after(1000, self.tick)

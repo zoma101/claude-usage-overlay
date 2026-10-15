@@ -51,13 +51,13 @@ Your settings are saved to `overlay_config.json` next to the script.
 
 ## How it works
 
-Every 60 seconds the overlay reads the OAuth token that Claude Code stores in `~/.claude/.credentials.json` and calls the same usage endpoint that Claude Code's `/usage` command uses. The token is sent only to `api.anthropic.com` and is never written anywhere else.
+Every 2 minutes the overlay reads the OAuth token that Claude Code stores in `~/.claude/.credentials.json` and calls the same usage endpoint that Claude Code's `/usage` command uses. The token is sent only to `api.anthropic.com` and is never written anywhere else.
 
 If the numbers turn grey with a `!` line underneath, the last refresh failed:
 
 - **token expired - open Claude Code**: the token expires after a while and only Claude Code renews it. Start Claude Code once and the overlay recovers by itself.
-- **offline**: there's no connection. It retries every minute.
-- **HTTP 429**: you've been rate-limited. It waits 5 minutes before retrying.
+- **offline**: there's no connection. It retries every 2 minutes.
+- **rate limited**: the usage endpoint is asking for fewer requests. The overlay waits 5 minutes, then 10, 20 and up to 30 minutes if it keeps happening, and shows a countdown to the next try. Avoid running several copies at once, since they add up.
 
 ## Notes
 
