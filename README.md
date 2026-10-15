@@ -8,6 +8,8 @@ A tiny always-on-top usage meter for Claude, like an FPS counter in a game. It s
 
 Each value has a countdown (`↻`) to its reset. Colors go green → yellow → red as you approach a limit.
 
+![The overlay in the bottom-right corner of a Windows desktop](docs/desktop.png)
+
 ![Skins](docs/skins.png)
 
 ## Requirements
