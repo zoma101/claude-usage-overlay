@@ -25,10 +25,14 @@ __version__ = "1.0.0"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CONFIG = Path(__file__).with_name("overlay_config.json")
 CACHE = Path(__file__).with_name("overlay_cache.json")  # last known usage, shown on startup
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+FEED = CLAUDE_DIR / "usage-overlay-feed.json"  # written by claude_usage_feed.py
 IS_WINDOWS = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 
-POLL_SECONDS = 120
+POLL_SECONDS = 180          # API poll when no status-line feed is available
+FEED_POLL_SECONDS = 600     # API poll while the feed is active (per-model limits only)
+STALE_SECONDS = 900         # values older than this are greyed out
 BACKOFF_SECONDS = 300       # first wait after a 429 (doubles on each repeat)
 MAX_BACKOFF_SECONDS = 1800
 MIN_MANUAL_REFRESH = 15     # double-click can't hammer the endpoint
@@ -122,10 +126,35 @@ def save_cache(rows):
 
 
 # --- data --------------------------------------------------------------------
+def read_feed():
+    """Session/week usage written by Claude Code's status line (see claude_usage_feed.py).
+
+    Claude Code hands this data to the status line for free on every reply, so it
+    is fresher than the API and never rate limited. It has no per-model limits.
+    """
+    try:
+        limits = json.loads(FEED.read_text(encoding="utf-8")).get("rate_limits") or {}
+    except Exception:
+        return None
+    rows = []
+    for field, key, short, name in (("five_hour", "session", "SES", "Session"),
+                                    ("seven_day", "week", "WK", "Week")):
+        block = limits.get(field) or {}
+        if block.get("used_percentage") is None:
+            continue
+        resets = block.get("resets_at")
+        try:
+            resets_at = datetime.fromtimestamp(float(resets), timezone.utc) if resets else None
+        except (TypeError, ValueError):
+            resets_at = parse_time(resets)
+        rows.append(dict(key=key, short=short, name=name,
+                         pct=block["used_percentage"], resets_at=resets_at))
+    return rows
+
+
 def read_token():
     """Claude Code's OAuth access token (it refreshes this file itself)."""
-    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-    cred_file = config_dir / ".credentials.json"
+    cred_file = CLAUDE_DIR / ".credentials.json"
     if cred_file.exists():
         raw = cred_file.read_text(encoding="utf-8")
     elif IS_MAC:
@@ -245,7 +274,7 @@ class Overlay:
         self.rows = load_cache() or [
             dict(key="session", short="SES", name="Session", pct=None, resets_at=None),
             dict(key="week", short="WK", name="Week", pct=None, resets_at=None)]
-        self.stale = True
+        self.feed_mtime = 0.0
         self.error = None
         self.next_poll = 0.0
         self.last_poll = 0.0
@@ -526,8 +555,33 @@ class Overlay:
         if not self.backoff:
             self.next_poll = min(self.next_poll, self.last_poll + MIN_MANUAL_REFRESH)
 
+    def feed_active(self):
+        return time.time() - self.feed_mtime < STALE_SECONDS
+
+    def check_feed(self):
+        """Apply new session/week numbers written by Claude Code's status line."""
+        try:
+            mtime = FEED.stat().st_mtime
+        except OSError:
+            return
+        if mtime <= self.feed_mtime:
+            return
+        self.feed_mtime = mtime
+        feed_rows = read_feed()
+        if not feed_rows:
+            return
+        by_key = {r["key"]: r for r in self.rows}
+        for new in feed_rows:
+            new["updated"] = mtime
+            if new["key"] in by_key:
+                by_key[new["key"]].update(pct=new["pct"], resets_at=new["resets_at"], updated=mtime)
+            else:
+                self.rows.insert(0 if new["key"] == "session" else 1, new)
+        save_cache(self.rows)
+
     def poll(self):
-        delay = POLL_SECONDS
+        # With the status-line feed active, the API is only needed for per-model limits.
+        delay = FEED_POLL_SECONDS if self.feed_active() else POLL_SECONDS
         rows, error = None, None
         try:
             rows = fetch_usage() or None
@@ -556,9 +610,16 @@ class Overlay:
 
     def on_data(self, rows, error):
         if rows is not None:
+            now = time.time()
+            old = {r["key"]: r for r in self.rows}
+            for row in rows:
+                row["updated"] = now
+                # Keep a status-line value if it is newer than this API response.
+                prev = old.get(row["key"])
+                if prev and prev.get("updated", 0) > now:
+                    row.update(pct=prev["pct"], resets_at=prev["resets_at"], updated=prev["updated"])
             self.rows = rows
             save_cache(rows)
-        self.stale = rows is None
         self.error = error
         self.render()
 
@@ -566,21 +627,29 @@ class Overlay:
         if self.built_for != self.layout_signature():
             self.rebuild()
         t = self.theme
+        now = datetime.now(timezone.utc)
+        any_stale = False
         for row, update in zip(self.rows, self.updaters):
             used = row["pct"]
             if used is None:
                 update("--", t["dim"], 0, "")
+                any_stale = True
                 continue
+            if row["resets_at"] and row["resets_at"] <= now:
+                used = 0  # the window has reset since we last heard
+            stale = time.time() - row.get("updated", 0) > STALE_SECONDS
+            any_stale |= stale
             shown = used if self.cfg["mode"] == "used" else max(0, 100 - used)
-            color = t["dim"] if self.stale else t["high"] if used >= 80 else t["mid"] if used >= 50 else t["low"]
+            color = t["dim"] if stale else t["high"] if used >= 80 else t["mid"] if used >= 50 else t["low"]
             update(f"{round(shown)}%", color, min(1, shown / 100), fmt_countdown(row["resets_at"]))
-        error = self.error
+        # API errors only matter to the viewer while some value is out of date.
+        error = self.error if any_stale else None
         if error == "rate limited":
             wait = max(0, int(self.next_poll - time.monotonic()))
             error = f"rate limited, retry {wait // 60}:{wait % 60:02d}"
         self.status.config(text=f"! {error}" if error else "")
-        if bool(self.error) != self.status_shown:
-            self.status_shown = bool(self.error)
+        if bool(error) != self.status_shown:
+            self.status_shown = bool(error)
             if self.status_shown:
                 self.status.pack(fill="x")
             else:
@@ -592,6 +661,7 @@ class Overlay:
         return tuple(r["key"] for r in self.rows), tuple(self.cfg[k] for k in VISUAL_KEYS)
 
     def tick(self):
+        self.check_feed()
         if not self.fetching and time.monotonic() >= self.next_poll:
             self.fetching = True
             self.last_poll = time.monotonic()
