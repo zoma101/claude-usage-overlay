@@ -233,6 +233,19 @@ def fmt_countdown(resets_at):
     return f"{m}m"
 
 
+def enable_dpi_awareness():
+    """Render crisply on scaled displays (125%, 150%...) instead of being stretched."""
+    if not IS_WINDOWS:
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system DPI aware
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 # --- Windows autostart -------------------------------------------------------
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "ClaudeUsageOverlay"
@@ -283,7 +296,10 @@ class Overlay:
         self.built_for = None
         self.updaters = []
 
+        enable_dpi_awareness()
         root = self.root = tk.Tk()
+        # Pixel sizes below are designed for 96 DPI; scale them on high-DPI screens.
+        self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
         root.title("Claude Usage")
         root.overrideredirect(True)
         root.attributes("-topmost", True)
@@ -298,6 +314,9 @@ class Overlay:
         root.after(200, self.place)
         self.tick()
         self.keep_on_top()
+
+    def px(self, n):
+        return round(n * self.scale)
 
     @property
     def theme(self):
@@ -364,7 +383,7 @@ class Overlay:
             self.container.destroy()
         self.root.configure(bg=t["bg"])
         self.root.attributes("-alpha", self.cfg["opacity"] / 100)
-        self.container = tk.Frame(self.root, bg=t["bg"], padx=8, pady=5,
+        self.container = tk.Frame(self.root, bg=t["bg"], padx=self.px(8), pady=self.px(5),
                                   highlightthickness=1 if t.get("border") else 0,
                                   highlightbackground=t.get("border", t["bg"]))
         self.container.pack()
@@ -405,7 +424,7 @@ class Overlay:
     def build_bars(self, body, row, i):
         t, size = self.theme, self.font_size
         self.label(body, row["short"], anchor="w", width=4).grid(row=i, column=0, sticky="w")
-        w, h = size * 10, max(6, size - 2)
+        w, h = self.px(size * 10), self.px(max(6, size - 2))
         bar = tk.Canvas(body, width=w, height=h, bg=t["track"], highlightthickness=0)
         bar.grid(row=i, column=1, padx=(2, 6), pady=2)
         fill = bar.create_rectangle(0, 0, 0, h, width=0, fill=t["low"])
@@ -442,12 +461,12 @@ class Overlay:
         t, size = self.theme, self.font_size
         col = tk.Frame(body, bg=t["bg"])
         col.grid(row=0, column=i, padx=4)
-        d = size * 5
-        stroke = max(3, size // 2)
+        d = self.px(size * 5)
+        stroke = self.px(max(3, size // 2))
         ring = tk.Canvas(col, width=d, height=d, bg=t["bg"], highlightthickness=0)
         ring.pack()
         pad = stroke / 2 + 1
-        ring.create_oval(pad, pad, d - pad, d - pad, outline=t["track"], width=stroke)
+        track = ring.create_oval(pad, pad, d - pad, d - pad, outline=t["track"], width=stroke)
         arc = ring.create_arc(pad, pad, d - pad, d - pad, start=90, extent=0,
                               style="arc", outline=t["low"], width=stroke)
         text_id = ring.create_text(d / 2, d / 2, text="--", fill=t["fg"],
@@ -458,7 +477,10 @@ class Overlay:
             reset.pack()
 
         def update(text, color, frac, countdown):
-            ring.itemconfig(arc, extent=-min(359.9, 360 * frac), outline=color)
+            # Tk draws near-360-degree arcs unreliably, so a full ring recolors the track instead.
+            full = frac >= 0.995
+            ring.itemconfig(track, outline=color if full else t["track"])
+            ring.itemconfig(arc, extent=0 if full else -360 * frac, outline=color)
             ring.itemconfig(text_id, text=text, fill=color)
             reset.config(text=countdown)
         return update
@@ -493,8 +515,9 @@ class Overlay:
         if corner:
             w, h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
             left, top, right, bottom = self.work_area()
-            x = left + MARGIN if "left" in corner else right - w - MARGIN
-            y = top + MARGIN if "top" in corner else bottom - h - MARGIN
+            margin = self.px(MARGIN)
+            x = left + margin if "left" in corner else right - w - margin
+            y = top + margin if "top" in corner else bottom - h - margin
         else:
             x, y = self.cfg.get("x", 0), self.cfg.get("y", 0)
             # Keep the whole overlay on screen when it grows (e.g. an error line appears).
