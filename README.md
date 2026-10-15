@@ -65,6 +65,8 @@ Your settings are saved to `overlay_config.json` next to the script.
 
 Every 3 minutes (every 10 with the status-line feed) the overlay reads the OAuth token that Claude Code stores in `~/.claude/.credentials.json` and calls the same usage endpoint that Claude Code's `/usage` command uses. The token is sent only to `api.anthropic.com` and is never written anywhere else.
 
+A limit at 100% stays in full colour until its reset, since it can't change before then (the overlay still rechecks it hourly, in case you upgrade your plan).
+
 If the numbers turn grey with a `!` line underneath, the last refresh failed:
 
 - **token expired - open Claude Code**: the token expires after a while and only Claude Code renews it. Start Claude Code once and the overlay recovers by itself.

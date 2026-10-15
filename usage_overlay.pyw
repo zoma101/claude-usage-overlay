@@ -33,6 +33,7 @@ IS_MAC = sys.platform == "darwin"
 POLL_SECONDS = 180          # API poll when no status-line feed is available
 FEED_POLL_SECONDS = 600     # API poll while the feed is active (per-model limits only)
 STALE_SECONDS = 900         # values older than this are greyed out
+MAXED_RECHECK_SECONDS = 3600  # recheck a 100% limit hourly (e.g. after a plan upgrade)
 BACKOFF_SECONDS = 300       # first wait after a 429 (doubles on each repeat)
 MAX_BACKOFF_SECONDS = 1800
 MIN_MANUAL_REFRESH = 15     # double-click can't hammer the endpoint
@@ -215,6 +216,12 @@ def parse_usage(payload):
             rows.append(dict(key=key, short=short, name=name, pct=block.get("utilization"),
                              resets_at=parse_time(block.get("resets_at"))))
     return rows
+
+
+def is_maxed(row):
+    """At 100% with a known future reset: the value is certain until then."""
+    return (row.get("pct") or 0) >= 100 and row.get("resets_at") is not None \
+        and row["resets_at"] > datetime.now(timezone.utc)
 
 
 def fmt_countdown(resets_at):
@@ -660,7 +667,8 @@ class Overlay:
                 continue
             if row["resets_at"] and row["resets_at"] <= now:
                 used = 0  # the window has reset since we last heard
-            stale = time.time() - row.get("updated", 0) > STALE_SECONDS
+            # A maxed-out limit can't change before its reset, so it never goes stale.
+            stale = not is_maxed(row) and time.time() - row.get("updated", 0) > STALE_SECONDS
             any_stale |= stale
             shown = used if self.cfg["mode"] == "used" else max(0, 100 - used)
             color = t["dim"] if stale else t["high"] if used >= 80 else t["mid"] if used >= 50 else t["low"]
@@ -686,11 +694,30 @@ class Overlay:
     def tick(self):
         self.check_feed()
         if not self.fetching and time.monotonic() >= self.next_poll:
-            self.fetching = True
-            self.last_poll = time.monotonic()
-            threading.Thread(target=self.poll, daemon=True).start()
+            hold = self.api_hold_until() - time.time()
+            if hold > 0:
+                self.next_poll = time.monotonic() + hold
+            else:
+                self.fetching = True
+                self.last_poll = time.monotonic()
+                threading.Thread(target=self.poll, daemon=True).start()
         self.render()
         self.root.after(1000, self.tick)
+
+    def api_hold_until(self):
+        """Epoch time until which the API has nothing new to tell us.
+
+        With the status-line feed covering session/week, the API is only needed for
+        per-model limits. If those are all maxed out, they can't change before they
+        reset (barring a plan upgrade, covered by an hourly check).
+        """
+        if not self.feed_active():
+            return 0
+        api_rows = [r for r in self.rows if r["key"] not in ("session", "week")]
+        if not api_rows or not all(is_maxed(r) for r in api_rows):
+            return 0
+        return min(min(r["resets_at"].timestamp() + 30, r.get("updated", 0) + MAXED_RECHECK_SECONDS)
+                   for r in api_rows)
 
 
 if __name__ == "__main__":
